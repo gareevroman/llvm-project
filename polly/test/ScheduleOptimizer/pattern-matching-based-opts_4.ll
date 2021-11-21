@@ -1,12 +1,13 @@
 ; RUN: opt %loadPolly -polly-opt-isl -polly-pattern-matching-based-opts=true \
-; RUN: -debug < %s 2>&1| FileCheck %s
+; RUN: -debug -polly-pattern-matching-based-tc-opts=true < %s 2>&1| FileCheck %s
 ; RUN: opt %loadPolly -polly-opt-isl -polly-pattern-matching-based-opts=true \
 ; RUN: -polly-target-throughput-vector-fma=1 \
 ; RUN: -polly-target-latency-vector-fma=8 \
 ; RUN: -polly-target-1st-cache-level-size=32768 \
 ; RUN: -polly-target-vector-register-bitwidth=256 \
 ; RUN: -polly-target-2nd-cache-level-size=262144 -polly-ast \
-; RUN: -analyze < %s | FileCheck %s --check-prefix=PATTERN-MATCHING-OPTS
+; RUN: -analyze -polly-pattern-matching-based-tc-opts=true < %s |  \
+; RUN: FileCheck %s --check-prefix=PATTERN-MATCHING-OPTS
 ; REQUIRES: asserts
 ;
 ;    C := A * B + C
@@ -20,13 +21,13 @@
 ;        for (j = 0; j < _PB_NJ; j++)
 ;	   C[i][j] += A[i][k] * B[k][j];
 ;
-; CHECK: The matrix multiplication pattern was detected
+; CHECK: The tensor contraction pattern was detected
 ;
 ; PATTERN-MATCHING-OPTS:    // 1st level tiling - Tiles
 ; PATTERN-MATCHING-OPTS-NEXT:    for (int c1 = 0; c1 <= 3; c1 += 1) {
-; PATTERN-MATCHING-OPTS-NEXT:      for (int c3 = 256 * c1; c3 <= 256 * c1 + 255; c3 += 1)
-; PATTERN-MATCHING-OPTS-NEXT:        for (int c4 = 0; c4 <= 1023; c4 += 1)
-; PATTERN-MATCHING-OPTS-NEXT:          CopyStmt_0(0, c3, c4);
+; PATTERN-MATCHING-OPTS-NEXT:      for (int c4 = 256 * c1; c4 <= 256 * c1 + 255; c4 += 1)
+; PATTERN-MATCHING-OPTS-NEXT:        for (int c5 = 0; c5 <= 1023; c5 += 1)
+; PATTERN-MATCHING-OPTS-NEXT:          CopyStmt_0(0, c1, c4, c5);
 ; PATTERN-MATCHING-OPTS-NEXT:      for (int c2 = 0; c2 <= 10; c2 += 1) {
 ; PATTERN-MATCHING-OPTS-NEXT:        for (int c6 = 96 * c2; c6 <= min(1023, 96 * c2 + 95); c6 += 1)
 ; PATTERN-MATCHING-OPTS-NEXT:          for (int c7 = 256 * c1; c7 <= 256 * c1 + 255; c7 += 1)

@@ -456,11 +456,6 @@ bool ScheduleTreeOptimizer::isTileableBandNode(isl::schedule_node Node) {
   if (!isl_schedule_node_band_get_permutable(Node.get()))
     return false;
 
-  auto Space = isl::manage(isl_schedule_node_band_get_space(Node.get()));
-
-  if (unsignedFromIslSize(Space.dim(isl::dim::set)) <= 1u)
-    return false;
-
   return isSimpleInnermostBand(Node);
 }
 
@@ -509,6 +504,7 @@ ScheduleTreeOptimizer::optimizeBand(__isl_take isl_schedule_node *NodeArg,
   assert(OAI && "Expecting optimization options");
 
   isl::schedule_node Node = isl::manage(NodeArg);
+
   if (!isTileableBandNode(Node))
     return Node.release();
 
@@ -520,6 +516,9 @@ ScheduleTreeOptimizer::optimizeBand(__isl_take isl_schedule_node *NodeArg,
       return PatternOptimizedSchedule.release();
     }
   }
+
+  if (isl_schedule_node_band_n_member(Node.get()) <= 1)
+    return Node.release();
 
   if (OAI->Postopts)
     Node = applyTileBandOpt(Node);

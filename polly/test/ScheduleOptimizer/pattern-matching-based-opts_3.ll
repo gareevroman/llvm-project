@@ -88,9 +88,9 @@
 ; EXTRACTION-OF-MACRO-KERNEL-NEXT:        }
 ; EXTRACTION-OF-MACRO-KERNEL-NEXT:      // 1st level tiling - Tiles
 ; EXTRACTION-OF-MACRO-KERNEL-NEXT:      for (int c1 = 0; c1 <= 3; c1 += 1) {
-; EXTRACTION-OF-MACRO-KERNEL-NEXT:        for (int c3 = 0; c3 <= 1055; c3 += 1)
-; EXTRACTION-OF-MACRO-KERNEL-NEXT:          for (int c4 = 256 * c1; c4 <= 256 * c1 + 255; c4 += 1)
-; EXTRACTION-OF-MACRO-KERNEL-NEXT:            CopyStmt_0(0, c3, c4);
+; EXTRACTION-OF-MACRO-KERNEL-NEXT:        for (int c4 = 256 * c1; c4 <= 256 * c1 + 255; c4 += 1)
+; EXTRACTION-OF-MACRO-KERNEL-NEXT:          for (int c5 = 0; c5 <= 1055; c5 += 1)
+; EXTRACTION-OF-MACRO-KERNEL-NEXT:            CopyStmt_0(0, c1, c4, c5);
 ; EXTRACTION-OF-MACRO-KERNEL-NEXT:        for (int c2 = 0; c2 <= 10; c2 += 1) {
 ; EXTRACTION-OF-MACRO-KERNEL-NEXT:          for (int c6 = 96 * c2; c6 <= 96 * c2 + 95; c6 += 1)
 ; EXTRACTION-OF-MACRO-KERNEL-NEXT:            for (int c7 = 256 * c1; c7 <= 256 * c1 + 255; c7 += 1)

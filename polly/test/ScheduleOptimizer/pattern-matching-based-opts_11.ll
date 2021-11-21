@@ -8,7 +8,8 @@
 ; RUN: -polly-target-1st-cache-level-size=32768 \
 ; RUN: -polly-target-vector-register-bitwidth=256 \
 ; RUN: -polly-target-2nd-cache-level-size=262144 \
-; RUN: -polly-opt-isl -debug < %s 2>&1 \
+; RUN: -polly-opt-isl -debug \
+; RUN: -polly-pattern-matching-based-tc-opts=true < %s 2>&1 \
 ; RUN: | FileCheck %s
 ; REQUIRES: asserts
 ;
@@ -16,7 +17,7 @@
 ; in case scalar memory accesses were replaced by accesses to newly created
 ; arrays.
 ;
-; CHECK: The matrix multiplication pattern was detected
+; CHECK: The tensor contraction pattern was detected
 ;
 target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-unknown"

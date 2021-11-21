@@ -1,5 +1,5 @@
 ; RUN: opt %loadPolly -polly-opt-isl -polly-pattern-matching-based-opts=false \
-; RUN: -debug < %s 2>&1| FileCheck %s
+; RUN: -debug -polly-pattern-matching-based-tc-opts < %s 2>&1| FileCheck %s
 ; RUN: opt %loadPolly -polly-opt-isl -polly-pattern-matching-based-opts=true -debug < %s 2>&1| FileCheck %s --check-prefix=PATTERN-MATCHING-OPTS
 ; RUN: opt %loadPolly -polly-opt-isl -polly-pattern-matching-based-opts=true -polly-ast-detect-parallel -polly-ast -analyze < %s | FileCheck %s --check-prefix=PARALLEL-AST
 ; RUN: opt %loadPolly -polly-opt-isl -polly-pattern-matching-based-opts=true -stats -disable-output < %s 2>&1| FileCheck %s --check-prefix=STATS -match-full-lines
@@ -15,6 +15,7 @@
 ;        }
 ;
 ; CHECK-NOT: The matrix multiplication pattern was detected
+; CHECK-NOT: The tensor contraction pattern was detected
 ; PATTERN-MATCHING-OPTS: The matrix multiplication pattern was detected
 ; PARALLEL-AST: #pragma known-parallel
 ; PARALLEL-AST: #pragma known-parallel

@@ -13,6 +13,7 @@
 #include "polly/ScopInfo.h"
 #include "polly/ScopPass.h"
 #include "polly/Simplify.h"
+#include "polly/Support/GICHelper.h"
 #include "polly/Support/ISLTools.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Optional.h"
@@ -126,6 +127,12 @@ static cl::opt<int> PollyPatternMatchingNcQuotient(
              "macro-kernel, by Nr, the parameter of the micro-kernel"),
     cl::Hidden, cl::init(256), cl::ZeroOrMore, cl::cat(PollyCategory));
 
+static cl::opt<bool>
+    PMTCBasedOpts("polly-pattern-matching-based-tc-opts",
+                  cl::desc("Perform optimizations of tensor contraction based "
+                           "on pattern matching"),
+                  cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
 namespace {
 /// Parameters of the micro kernel.
 ///
@@ -158,6 +165,27 @@ struct MatMulInfoTy {
   int i = -1;
   int j = -1;
   int k = -1;
+};
+
+/// Parameters of the tensor contraction operands.
+///
+/// Parameters, which describe access relations that represent operands of the
+/// tensor contraction.
+struct TCInfoTy {
+  MemoryAccess *A = nullptr;
+  MemoryAccess *B = nullptr;
+  MemoryAccess *ReadFromC = nullptr;
+  MemoryAccess *WriteToC = nullptr;
+  std::set<int> I;
+  std::set<int> J;
+  std::set<int> P;
+  SmallVector<int, 30> DimensionSizes;
+  SmallVector<int, 30> ADimensions;
+  SmallVector<int, 30> BDimensions;
+  SmallVector<int, 30> CDimensions;
+  SmallVector<int, 30> OrderedI;
+  SmallVector<int, 30> OrderedJ;
+  SmallVector<int, 30> OrderedP;
 };
 
 /// Create an isl::union_set, which describes the option of the form
@@ -701,6 +729,28 @@ static isl::schedule_node createExtensionNode(isl::schedule_node Node,
   return Node.graft_before(NewNode);
 }
 
+static ScopStmt *addScopStmt(ScopStmt *Stmt, isl::map AccRel,
+                             isl::map PackedTranslator, isl::map OuterDomainMap,
+                             isl::map MapOldIndVar) {
+  isl::set Domain = Stmt->getDomain();
+  // Prevent the unbound optimum
+  isl::map CopyFrom = MapOldIndVar.intersect_domain(Domain);
+  // { Scatter[] -> MemrefA[] }
+  CopyFrom = CopyFrom.reverse().apply_range(AccRel);
+  // { Scatter[] -> CopyStmt[] }
+  isl::map DomainTranslator = OuterDomainMap.range_product(CopyFrom);
+  // { CopyStmt[] }
+  isl::set CopyDomain = DomainTranslator.range();
+
+  // Translate the access relations to the new domain.
+  // { CopyStmt[] -> MemrefA[] }
+  CopyFrom = CopyFrom.apply_domain(DomainTranslator);
+  // { CopyStmt[] -> PackedA[] }
+  isl::map CopyTo = CopyFrom.apply_range(PackedTranslator);
+
+  return Stmt->getParent()->addScopStmt(CopyFrom, CopyTo, CopyDomain);
+}
+
 static isl::schedule_node optimizePackedB(isl::schedule_node Node,
                                           ScopStmt *Stmt, isl::map MapOldIndVar,
                                           MicroKernelParamsTy MicroParams,
@@ -719,23 +769,30 @@ static isl::schedule_node optimizePackedB(isl::schedule_node Node,
 
   // Compute the access relation for copying from B to PackedB.
   isl::map AccRelB = MMI.B->getLatestAccessRelation();
+  unsigned AccRelBDimOutNum = unsignedFromIslSize(AccRelB.dim(isl::dim::out));
   isl::map AccRelPackedB = getMatMulAccRel(MapOldIndVar, 3, 7);
   AccRelPackedB =
       AccRelPackedB.set_tuple_id(isl::dim::out, PackedB->getBasePtrId());
+  isl::map PackedBTranslator = AccRelPackedB.apply_domain(AccRelB);
 
-  // Create the copy statement and redirect access.
-  ScopStmt *CopyStmt = S->addScopStmt(AccRelB, AccRelPackedB, Domain);
+  // Compute the domain for the copy statement.
+  // Construct the copy statement domain out of the 2 outermost scatter
+  // dimensions (to match the 2 band nodes surrounding the extension node) and
+  // the array elements to copy (one statement instance per array element).
+  // { Scatter[] }
+  isl::set ScatterDomain = MapOldIndVar.intersect_domain(Domain).range();
+  isl::map OuterDomainMap =
+      makeIdentityMap(ScatterDomain, true).project_out(isl::dim::out, 2, 7);
+
+  ScopStmt *CopyStmt = addScopStmt(Stmt, AccRelB, PackedBTranslator,
+                                   OuterDomainMap, MapOldIndVar);
   MMI.B->setNewAccessRelation(AccRelPackedB);
 
-  unsigned Dim = unsignedFromIslSize(MapOldIndVar.range_tuple_dim());
-  assert(Dim >= 2);
-  // Insert into the schedule tree.
-  isl::map ExtMap = MapOldIndVar.project_out(isl::dim::out, 2, Dim - 2);
-  ExtMap = ExtMap.reverse();
-  ExtMap = ExtMap.fix_si(isl::dim::out, MMI.i, 0);
-  ExtMap = ExtMap.intersect_range(Domain);
-  ExtMap = ExtMap.set_tuple_id(isl::dim::out, CopyStmt->getDomainId());
-  return createExtensionNode(Node, ExtMap);
+  // { Scatter[] -> CopyStmt[] }
+  isl::map ExtScatterCopy = makeIdentityMap(CopyStmt->getDomain(), true);
+  ExtScatterCopy =
+      ExtScatterCopy.project_out(isl::dim::in, 2, AccRelBDimOutNum);
+  return createExtensionNode(Node, ExtScatterCopy);
 }
 
 static isl::schedule_node optimizePackedA(isl::schedule_node Node, ScopStmt *,
@@ -758,6 +815,7 @@ static isl::schedule_node optimizePackedA(isl::schedule_node Node, ScopStmt *,
 
   // Compute the access relation for copying from A to PackedA.
   isl::map AccRelA = MMI.A->getLatestAccessRelation();
+  unsigned AccRelADimOutNum = unsignedFromIslSize(AccRelA.dim(isl::dim::out));
   isl::map AccRelPackedA = getMatMulAccRel(MapOldIndVar, 4, 6);
   AccRelPackedA =
       AccRelPackedA.set_tuple_id(isl::dim::out, PackedA->getBasePtrId());
@@ -773,28 +831,17 @@ static isl::schedule_node optimizePackedA(isl::schedule_node Node, ScopStmt *,
   // { Scatter[] -> OutermostScatter[] }
   isl::map OuterDomainMap =
       makeIdentityMap(ScatterDomain, true).project_out(isl::dim::out, 3, 6);
-  // { Scatter[] -> MemrefA[] }
-  isl::map CopyFrom = MapOldIndVar.reverse().apply_range(AccRelA);
-  // { Scatter[] -> CopyStmt[] }
-  isl::map DomainTranslator = OuterDomainMap.range_product(CopyFrom);
-  // { CopyStmt[] }
-  isl::set CopyDomain = DomainTranslator.range();
-
-  // Translate the access relations to the new domain.
-  // { CopyStmt[] -> MemrefA[] }
-  CopyFrom = CopyFrom.apply_domain(DomainTranslator);
-  // { CopyStmt[] -> PackedA[] }
-  isl::map CopyTo = CopyFrom.apply_range(PackedATranslator);
 
   // Create the copy statement and redirect access.
-  ScopStmt *CopyStmt =
-      Stmt->getParent()->addScopStmt(CopyFrom, CopyTo, CopyDomain);
+  ScopStmt *CopyStmt = addScopStmt(Stmt, AccRelA, PackedATranslator,
+                                   OuterDomainMap, MapOldIndVar);
   MMI.A->setNewAccessRelation(AccRelPackedA);
 
   // Insert into the schedule tree.
   // { Scatter[] -> CopyStmt[] }
   isl::map ExtScatterCopy = makeIdentityMap(CopyStmt->getDomain(), true);
-  ExtScatterCopy = ExtScatterCopy.project_out(isl::dim::in, 3, 2);
+  ExtScatterCopy =
+      ExtScatterCopy.project_out(isl::dim::in, 3, AccRelADimOutNum);
   return createExtensionNode(Node, ExtScatterCopy);
 }
 
@@ -1024,12 +1071,628 @@ static bool isMatrMultPattern(isl::schedule_node Node, const Dependences *D,
   return false;
 }
 
+/// Get the dimension size.
+///
+/// Return the size of the dimension @p Pos, which is obtained from @p SAI.
+/// Return -1 in the case of first dimension of a multi-dimensional array, since
+/// the ScopArrayInfo class does not carry any size information.
+///
+/// @param SAI The information about the array.
+/// @param Pos The position of the dimension.
+/// @return The size of the dimension.
+static int getDimSize(const ScopArrayInfo *SAI, unsigned Pos) {
+  if (Pos == 0)
+    return -1;
+  const llvm::SCEV *SCEVDimSize = SAI->getDimensionSize(Pos);
+  assert(SCEVDimSize && L"Prevent the undefined behavior");
+  auto *ConstantDimSize = dyn_cast<const SCEVConstant>(SCEVDimSize);
+  assert(ConstantDimSize && L"Prevent the undefined behavior");
+  auto *IntDimSize = dyn_cast<ConstantInt>(ConstantDimSize->getValue());
+  assert(IntDimSize && L"Prevent the undefined behavior");
+  return IntDimSize->getSExtValue();
+}
+
+/// Check whether the access relation has the specified form.
+///
+/// Check that the access relation @p AccMap has the form T[i1, …, in], where
+/// indexes i1, …, in are specified by @p Dimensions.
+///
+/// @param Domain     The domain of the access relation.
+/// @param AccMap     The access relation to be checked.
+/// @param Dimensions The permutation of the subset of the input dimensions.
+/// @return True if @p AccMap has the expected form and false,
+///         otherwise.
+static bool isCorrectAccessMap(isl::set Domain, isl::map AccMap,
+                               const SmallVector<int, 30> &Dimensions) {
+  isl::space Space = AccMap.get_space();
+  if (unsignedFromIslSize(Space.dim(isl::dim::out)) != Dimensions.size())
+    return false;
+  isl::map Universe = isl::map::universe(Space);
+  isl::map PossibleTensor = isl::manage(Universe.copy());
+  for (int i = 0; i < static_cast<int>(Dimensions.size()); i++) {
+    const int InPos = Dimensions[i];
+    if (InPos == -1)
+      return false;
+    PossibleTensor =
+        PossibleTensor.equate(isl::dim::in, InPos, isl::dim::out, i);
+  }
+  AccMap = AccMap.intersect_domain(Domain);
+  PossibleTensor = PossibleTensor.intersect_domain(Domain);
+
+  // If AccMap spans entire domain (Non-partial write),
+  // compute FirstPos and SecondPos.
+  // If AccMap != PossibleTensor here (the two maps have been gisted at
+  // this point), it means that the writes are not complete, or in other
+  // words, it is a Partial write and Partial writes must be rejected.
+  return AccMap.is_equal(PossibleTensor);
+}
+
+/// Check whether the access can represent the tensor contraction operand.
+///
+/// Check that the access relation @p AccMap has the form T[i1, …, in].
+/// Obtained indexes i1, …, in, their sizes and permutation are stored into
+/// @p  IndexSet, @p DimensionSizes, and @p Dimensions, respectively.
+///
+/// @param Domain         The domain of the access relation.
+/// @param AccMap         The access relation to be checked.
+/// @param IndexSet       The subset of the input dimensions.
+/// @param DimensionSizes Sizes of the input dimensions of @p Dimensions.
+/// @param Dimensions     The permutation of the subset of the input dimensions.
+/// @return True if @p AccMap has the expected form and false,
+///         otherwise.
+static bool isTCOperandAcc(isl::set Domain, isl::map AccMap,
+                           std::set<int> &IndexSet,
+                           SmallVector<int, 30> &DimensionSizes,
+                           SmallVector<int, 30> &Dimensions) {
+  isl::id Id = AccMap.get_tuple_id(isl::dim::out);
+  const ScopArrayInfo *SAI = ScopArrayInfo::getFromId(Id);
+  assert(SAI && "AccMap should represent memory access");
+  isl::map CheckMap = isl::manage(AccMap.copy());
+  unsigned OutDimNum = unsignedFromIslSize(CheckMap.dim(isl::dim::out));
+  for (unsigned i = 0; i < OutDimNum; i++)
+    CheckMap = CheckMap.fix_si(isl::dim::out, i, i);
+  Dimensions.assign(OutDimNum, -1);
+  unsigned InDimNum = unsignedFromIslSize(CheckMap.dim(isl::dim::in));
+  for (unsigned i = 0; i < InDimNum; i++) {
+    isl::val Val = isl::manage(
+        isl_map_plain_get_val_if_fixed(CheckMap.get(), isl_dim_in, i));
+    if (!Val.is_int())
+      continue;
+    int OutPos = -1;
+    llvm::APInt ValAPInt = APIntFromVal(Val);
+    if (ValAPInt.isSignedIntN(32))
+      OutPos = ValAPInt.getSExtValue();
+    assert((OutPos != -1) && (OutPos < static_cast<int>(OutDimNum)) &&
+           L"Prevent the undefined behavior");
+    if (IndexSet.count(i))
+      return false;
+    IndexSet.insert(i);
+    Dimensions[OutPos] = i;
+    if (DimensionSizes[i] <= 0)
+      DimensionSizes[i] = getDimSize(SAI, OutPos);
+  }
+  return isCorrectAccessMap(Domain, AccMap, Dimensions);
+}
+
+/// Find the intersection of two sets.
+///
+/// Find the intersection of the set @p A and the set @p B.
+///
+/// @param A, B Sets to intersect.
+/// @return The set intersection.
+std::set<int> intersect(const std::set<int> &A, const std::set<int> &B) {
+  std::set<int> Intersection;
+  set_intersection(A.begin(), A.end(), B.begin(), B.end(),
+                   std::inserter(Intersection, Intersection.begin()));
+  return Intersection;
+}
+
+/// Find the difference of two sets.
+///
+/// Find the difference of the set @p A and the set @p B.
+///
+/// @param A The first operand of set difference.
+/// @param B The second operand of set difference.
+/// @return The set difference.
+std::set<int> difference(const std::set<int> &A, const std::set<int> &B) {
+  std::set<int> Difference;
+  set_difference(A.begin(), A.end(), B.begin(), B.end(),
+                 std::inserter(Difference, Difference.begin()));
+  return Difference;
+}
+
+/// Determine the access, which writes to the tensor C.
+///
+/// @param Domain        The domain of the statement.
+/// @param Stmt          The statement, which writes to memory.
+/// @param TCI           The information about the tensor contraction.
+/// @param IandJIndexSet The set, which contains free indexes of tensors.
+void setWriteAccess(isl::set Domain, ScopStmt *Stmt, TCInfoTy &TCI,
+                    std::set<int> &IandJIndexSet) {
+  TCI.WriteToC = nullptr;
+  SmallVector<MemoryAccess *, 32> Accesses = getAccessesInOrder(*Stmt);
+  auto *MemA = Accesses.end() - 1;
+  for (; MemA != Accesses.begin(); MemA--) {
+    MemoryAccess *MemAccessPtr = *MemA;
+    if (!MemAccessPtr->isLatestArrayKind())
+      continue;
+    if (!MemAccessPtr->isWrite())
+      return;
+    isl::map AccMap = MemAccessPtr->getLatestAccessRelation();
+    if (!isTCOperandAcc(Domain, AccMap, IandJIndexSet, TCI.DimensionSizes,
+                        TCI.CDimensions))
+      return;
+    if (intersect(IandJIndexSet, TCI.P).size())
+      return;
+    TCI.WriteToC = MemAccessPtr;
+    break;
+  }
+}
+
+/// Determine an access, which reads elements of either an operand of the tensor
+/// contraction or its result
+///
+/// @param MemAccessPtr  The access, which reads elements of the tensor.
+/// @param IndexSet      The set, which contains indexes of the tensors.
+/// @param IandJIndexSet The set, which contains free indexes of tensors.
+/// @param Dimensions    The permutation of the subset of the input dimensions.
+/// @param TCI           The information about the tensor contraction.
+bool setReadAccess(MemoryAccess *MemAccessPtr, const std::set<int> &IndexSet,
+                   const std::set<int> &IandJIndexSet,
+                   SmallVector<int, 30> Dimensions, TCInfoTy &TCI) {
+  if (!TCI.A) {
+    // Probably IndexSet is a union of I and P sets
+    if (intersect(IndexSet, TCI.P).size() != TCI.P.size())
+      return false;
+    TCI.I = std::move(difference(IndexSet, TCI.P));
+    if (intersect(IandJIndexSet, TCI.I).size() != TCI.I.size())
+      return false;
+    TCI.J = std::move(difference(IandJIndexSet, TCI.I));
+    TCI.A = MemAccessPtr;
+    TCI.ADimensions = std::move(Dimensions);
+    return true;
+  }
+  if (!TCI.B) {
+    // Probably IndexSet is a union of J and P sets
+    if (!(intersect(IndexSet, TCI.J).size() == TCI.J.size()) &&
+        (intersect(IndexSet, TCI.P).size() == TCI.P.size()) &&
+        (IndexSet.size() == TCI.P.size() + TCI.J.size()))
+      return false;
+    TCI.B = MemAccessPtr;
+    TCI.BDimensions = std::move(Dimensions);
+    return true;
+  }
+  return false;
+}
+
+/// Determine accesses, which read elements of operands of the tensor
+/// contraction and its result
+///
+/// @param Domain        The domain of the statement.
+/// @param Stmt          The statement, which writes to memory.
+/// @param TCI           The information about the tensor contraction.
+/// @param IandJIndexSet The set, which contains free indexes of tensors.
+void setReadAccesses(isl::set Domain, ScopStmt *Stmt, TCInfoTy &TCI,
+                     std::set<int> &IandJIndexSet) {
+  TCI.A = nullptr;
+  TCI.B = nullptr;
+  TCI.ReadFromC = nullptr;
+  SmallVector<MemoryAccess *, 32> Accesses = getAccessesInOrder(*Stmt);
+  for (auto *MemA = Accesses.begin(); *MemA != TCI.WriteToC; MemA++) {
+    MemoryAccess *MemAccessPtr = *MemA;
+    if (!MemAccessPtr->isLatestArrayKind())
+      continue;
+    if (MemAccessPtr->isWrite())
+      return;
+    isl::map AccMap = MemAccessPtr->getLatestAccessRelation();
+    if (AccMap.is_equal(TCI.WriteToC->getLatestAccessRelation())) {
+      if (TCI.ReadFromC)
+        return;
+      TCI.ReadFromC = MemAccessPtr;
+      continue;
+    }
+    SmallVector<int, 30> Dimensions;
+    std::set<int> IndexSet;
+    if (!isTCOperandAcc(Domain, AccMap, IndexSet, TCI.DimensionSizes,
+                        Dimensions))
+      return;
+    if (!setReadAccess(MemAccessPtr, IndexSet, IandJIndexSet,
+                       std::move(Dimensions), TCI))
+      return;
+  }
+}
+
+/// Check accesses to operands of the tensor contraction.
+///
+/// Check that accesses of the SCoP statement, which corresponds to
+/// the partial schedule @p PartialSchedule, represents accesses
+/// to the non-scalar operands of the tensor contraction.
+///
+/// @param  Domain          The domain of the SCoP statement.
+/// @param  PartialSchedule The partial schedule of the SCoP statement.
+/// @param  TCI             Parameters of the tensor contraction operands.
+/// @return                 True if the corresponding SCoP statement
+///                         represents tensor contraction and false,
+///                         otherwise.
+static bool containsOnlyTCAcc(isl::set Domain, isl::map PartialSchedule,
+                              TCInfoTy &TCI) {
+  isl::id InputDimsId = PartialSchedule.get_tuple_id(isl::dim::in);
+  ScopStmt *Stmt = static_cast<ScopStmt *>(InputDimsId.get_user());
+  if (Stmt->size() <= 1)
+    return false;
+
+  unsigned DimNum = unsignedFromIslSize(PartialSchedule.dim(isl::dim::in));
+  TCI.DimensionSizes.resize(DimNum);
+  std::set<int> IandJIndexSet;
+  setWriteAccess(Domain, Stmt, TCI, IandJIndexSet);
+  if (!TCI.WriteToC)
+    return false;
+
+  if (intersect(IandJIndexSet, TCI.P).size() != 0)
+    return false;
+
+  setReadAccesses(Domain, Stmt, TCI, IandJIndexSet);
+  return TCI.ReadFromC && TCI.A && TCI.B;
+}
+
+/// Check that dependency corresponds to the tensor contraction.
+///
+/// Check that the dependency has the form
+/// S(..., ki, max(k(i + 1)), ..., max(kn), ...) ->
+/// S(..., ki + 1, min(k(i + 1)), ..., min(kn), ...), where S is the SCoP
+/// statement. For this purpose, we analyze the set @p DepDelta, which
+/// represents the differences between image elements and domain elements of
+/// the corresponding map.
+///
+/// @param  DepDelta    The set contains the differences between image elements
+///                     and corresponding domain elements of the map, which
+///                     represents the dependency.
+/// @param  Pos         The position of the index ki.
+/// @param  BoundDeltas In the case of indexes of ki, the difference between
+///                     image elements and corresponding domain elements
+///                     corresponds to the difference between lexicographic
+///                     minimum and lexicographic maximum of the corresponding
+///                     dimension of the domain of the statement.
+/// @param  IndexSet    Obtained indexes ki, which describe the dependency.
+/// @return True if dependencies correspond to the tensor contraction
+///         and false, otherwise.
+static bool isTcDep(isl::set DepDelta, unsigned Pos, isl::set BoundDeltas,
+                    std::set<int> *IndexSet) {
+  if ((unsignedFromIslSize(DepDelta.n_basic_set()) != 1) ||
+      !DepDelta.plain_get_val_if_fixed(isl::dim::set, Pos).is_one())
+    return false;
+  for (unsigned j = 0; j < Pos; j++)
+    if (!DepDelta.plain_get_val_if_fixed(isl::dim::set, j).is_zero())
+      return false;
+  isl::map DepDeltaNegToBoundDeltas = isl::map::from_domain_and_range(
+      isl::manage(isl_set_neg(DepDelta.copy())), BoundDeltas);
+  isl::set Complement = DepDeltaNegToBoundDeltas.deltas();
+  const unsigned DimNum = unsignedFromIslSize(DepDelta.dim(isl::dim::set));
+  for (unsigned j = Pos + 1; j < DimNum; j++) {
+    if (!IndexSet->count(j)) {
+      if (DepDelta.plain_get_val_if_fixed(isl::dim::set, j).is_zero())
+        continue;
+      return false;
+    }
+    if (!Complement.plain_get_val_if_fixed(isl::dim::set, j).is_zero())
+      return false;
+  }
+  return true;
+}
+
+/// Check that dependencies correspond to the tensor contraction.
+///
+/// Check that there are only true dependencies of the form
+/// S(..., ki, max(k(i + 1)), ..., max(kn), ...) ->
+/// S(..., ki + 1, min(k(i + 1)), ..., min(kn), ...), where S is the SCoP
+/// statement represented by @p Schedule. Such dependencies are produced by
+/// the tensor contraction. Obtained indexes ki  are stored into @p IndexSet.
+///
+/// @param  Schedule The schedule of the SCoP statement.
+/// @param  D        The SCoP dependencies.
+/// @param  Domain   The domain of the statement.
+/// @param  IndexSet Obtained indexes ki, which describe the dependencies.
+/// @return True if dependencies correspond to the tensor contraction
+///         and false, otherwise.
+static bool containsOnlyTcDeps(isl::map Schedule, const Dependences *D,
+                               std::set<int> *IndexSet, isl::set Domain) {
+  isl::union_map Dep = D->getDependences(Dependences::TYPE_RAW);
+  isl::union_map Red = D->getDependences(Dependences::TYPE_RED);
+  if (!Red.is_null())
+    Dep = Dep.unite(Red);
+  isl::space DomainSpace = Schedule.get_space().domain();
+  isl::space Space = DomainSpace.map_from_domain_and_range(DomainSpace);
+  isl::set DepDeltas = Dep.extract_map(Space).deltas();
+  unsigned DeltasDimNum = unsignedFromIslSize(DepDeltas.dim(isl::dim::set));
+  isl::set UpperBound = Domain.lexmax();
+  isl::set LowerBound = Domain.lexmin();
+  isl::map BoundMap = isl::map::from_domain_and_range(LowerBound, UpperBound);
+  isl::set BoundDeltas = BoundMap.deltas();
+  for (int i = static_cast<int>(DeltasDimNum) - 1; i >= 0; i--) {
+    isl::set Intersection = DepDeltas.fix_si(isl::dim::set, i, 1);
+    if (Intersection.is_empty())
+      continue;
+    if (!isTcDep(Intersection, i, BoundDeltas, IndexSet))
+      return false;
+    IndexSet->insert(i);
+    DepDeltas = DepDeltas.subtract(Intersection);
+  }
+  if ((DeltasDimNum == 0) || !DepDeltas.is_empty())
+    return false;
+  return true;
+}
+
+/// Order the dimensions of operands of the tensor contraction.
+///
+/// To improve the spatial locality of the data, we use a heuristic, which is
+/// introduced in [1]. The heuristic logically reorders the tensor dimensions
+/// and consists of the following steps:
+///
+/// 1. Sort the dimensions in I and J by increasing stride in the tensor C.
+/// 2. If tensor A contains the last dimension of C, swap A with B and I with J.
+/// 3. Sort the dimensions in P by increasing stride in the tensor A.
+///
+/// [1] - Devin Matthews. High-Performance Tensor Contraction without BLAS.
+/// SIAM Journal on Scientific Computing, 40(1). 2016. DOI: 10.1137/16M108968X.
+///
+/// @param TCI The information about tensors.
+static void orderDimensions(TCInfoTy &TCI) {
+  for (const int &Dimension : TCI.CDimensions) {
+    assert(!(TCI.I.count(Dimension) && TCI.J.count(Dimension)) &&
+           L"Prevent the undefined behavior");
+    if (TCI.I.count(Dimension)) {
+      TCI.OrderedI.push_back(Dimension);
+      continue;
+    }
+    if (TCI.J.count(Dimension))
+      TCI.OrderedJ.push_back(Dimension);
+  }
+  if (TCI.I.count(TCI.CDimensions.back())) {
+    MemoryAccess *Access = TCI.A;
+    TCI.A = TCI.B;
+    TCI.B = Access;
+    TCI.I.swap(TCI.J);
+    TCI.ADimensions.swap(TCI.BDimensions);
+    TCI.OrderedI.swap(TCI.OrderedJ);
+  }
+  for (const int &Dimension : TCI.ADimensions)
+    if (TCI.P.count(Dimension))
+      TCI.OrderedP.push_back(Dimension);
+}
+
+/// Check if the SCoP statement could probably be optimized with analytical
+/// modeling.
+///
+/// containsTC tries to determine whether the following conditions
+/// are true:
+/// 1. The last memory access modeling an array, MA1, represents writing to
+///    memory and has the form S(..., I, ..., J, ...) -> M(shuffle(I, J)),
+///    where S is the SCoP statement under consideration and shuffle(I, J)
+///    is a permutation of indexes of sets I and J.
+/// 2. There are only true dependencies of the form
+///    S(..., ki, max(k(i + 1)), ..., max(kn), ...) ->
+///    S(..., ki + 1, min(k(i + 1)), ..., min(kn), ...), where S is the SCoP
+///    statement represented by @p Schedule and ki are indexes of the set P.
+/// 3. SCoP contains only three access relations, MA2, MA3, and MA4 that
+///    represent reading from memory and have the form
+///    S(..., I, ..., P, ...) -> M(shuffle(I, P)),
+///    S(..., P, ..., J, ...) -> M(shuffle(J, P)),
+///    S(...) -> M(shuffle(I, J)), respectively.
+///
+/// @param PartialSchedule The PartialSchedule that contains a SCoP statement
+///                        to check.
+/// @param D               The SCoP dependencies.
+/// @param TCI             Parameters of the tensor contraction operands.
+/// @param Domain          The domain of the statement.
+static bool containsTCInfoTy(isl::map PartialSchedule, const Dependences *D,
+                             TCInfoTy &TCI, isl::set Domain) {
+  if (!containsOnlyTcDeps(PartialSchedule, D, &TCI.P, Domain))
+    return false;
+
+  // TODO: handle this case if needed
+  if (TCI.P.size() == 0)
+    return false;
+
+  if (!containsOnlyTCAcc(Domain, PartialSchedule, TCI))
+    return false;
+
+  // TODO: handle cases of GEMV if needed
+  if ((TCI.I.size() == 0) || (TCI.J.size() == 0))
+    return false;
+
+  orderDimensions(TCI);
+
+  return true;
+}
+
+/// Check if this node contains a partial schedule that could
+/// probably be optimized with analytical modeling.
+///
+/// isTCPattern tries to determine whether the following conditions
+/// are true:
+/// 1. the partial schedule contains only one statement.
+/// 2. there are exactly three input dimensions.
+/// 3. there are four memory accesses that represent accesses to tensor
+///    contraction operand.
+/// 4. all memory accesses of the statement except from the last one, are
+///    read memory accesses and the last one is a write memory access.
+/// 5. all subscripts of the last memory access of the statement don't
+///    contain the variable used in the inner loop.
+/// If this is the case, we could use an approach that is similar to
+/// the one used to get close-to-peak performance of matrix multiplications.
+///
+/// @param Node The node to check.
+/// @param D    The SCoP dependencies.
+/// @param TCI  Parameters of the tensor contraction operands.
+static bool isTCPattern(isl::schedule_node Node, const Dependences *D,
+                        TCInfoTy &TCI) {
+  Node = Node.child(0);
+  auto LeafType = isl_schedule_node_get_type(Node.get());
+  isl::union_map PartialSchedule = Node.get_prefix_schedule_union_map();
+  Node = Node.parent();
+  if (LeafType != isl_schedule_node_leaf ||
+      isl_union_map_n_map(PartialSchedule.get()) != 1)
+    return false;
+  isl::map PartialScheduleMap = isl::map::from_union_map(PartialSchedule);
+  auto NodeType = isl_schedule_node_get_type(Node.get());
+  while (NodeType != isl_schedule_node_domain) {
+    Node = Node.parent();
+    NodeType = isl_schedule_node_get_type(Node.get());
+  }
+  isl::union_set Domain = Node.as<isl::schedule_node_domain>().domain();
+  if (isl_union_set_n_set(Domain.get()) != 1)
+    return false;
+  if (containsTCInfoTy(PartialScheduleMap, D, TCI, isl::set(Domain)))
+    return true;
+  return false;
+}
+
+/// Logically map dimensions of a tensor to a dimension of an imaginary matrix
+///
+/// flattenDimensions returns a new dimension, which is a linear combination of
+/// @p Dimensions in order specified by @p DimensionsOrder. Specifically, a new
+/// dimension J can be represented as
+/// J = Dimensions[D0] A0 + … + Dimensions[D(N - 1)] * A(N - 1),
+/// where Di = DimensionsOrder[i],
+/// Ai = DimensionsSizes[i+1] * … * DimensionsSizes[N - 1].
+/// Using the described one-to-one mapping, which was introduced in [1], the
+/// opimization of the matrix multiplication of the corresponding imaginary
+/// matrices can be performed for the tensor contraction.
+///
+/// [1] - Devin Matthews. High-Performance Tensor Contraction without BLAS.
+/// SIAM Journal on Scientific Computing, 40(1). 2016. DOI: 10.1137/16M108968X.
+///
+/// @param Dimensions      Dimensions of the tensor.
+/// @param DimensionsOrder An order of dimensions in the linear combination.
+/// @param DimensionsSizes Sizes of dimensions in the linear combination.
+/// @return A new dimension.
+static isl::union_pw_aff
+flattenDimensions(isl::multi_union_pw_aff Dimensions,
+                  const SmallVector<int, 30> &DimensionsOrder,
+                  const SmallVector<int, 30> &DimensionsSizes) {
+  isl::union_pw_aff NewDimension;
+  isl::ctx Ctx = Dimensions.ctx();
+  for (const int &Dim : DimensionsOrder) {
+    if (NewDimension.is_null()) {
+      NewDimension = isl::manage(
+          isl_multi_union_pw_aff_get_union_pw_aff(Dimensions.get(), Dim));
+      continue;
+    }
+    int DimSize = DimensionsSizes[Dim];
+    if (DimSize > 0)
+      NewDimension = isl::manage(isl_union_pw_aff_scale_val(
+          NewDimension.release(), isl::val(Ctx, DimSize).release()));
+    else
+      NewDimension = isl::manage(isl_union_pw_aff_scale_val(
+          NewDimension.release(), isl::val(Ctx, 1).release()));
+    NewDimension = NewDimension.add(isl::manage(
+        isl_multi_union_pw_aff_get_union_pw_aff(Dimensions.get(), Dim)));
+  }
+  return NewDimension;
+}
+
+/// Logically represent tensor contraction operands as matrix multiplication
+/// operands.
+///
+/// Convert the information about tensor contraction operands into the
+/// information about matrix multiplication operands.
+///
+/// @param TCI The information about tensors.
+/// @return The information about matrix multiplication operands.
+static MatMulInfoTy convertToMatMulInfo(TCInfoTy &TCI) {
+  MatMulInfoTy NewMatMulInfo;
+  NewMatMulInfo.A = TCI.A;
+  NewMatMulInfo.B = TCI.B;
+  NewMatMulInfo.ReadFromC = TCI.ReadFromC;
+  NewMatMulInfo.WriteToC = TCI.WriteToC;
+  return NewMatMulInfo;
+}
+
+/// Logically cast the schedule tree that represents the tensor contraction into
+/// the schedule tree that represents the matrix multiplication
+///
+/// convertToMMMSchedule maps dimensions of tensors to dimensions of imaginary
+/// matrices, which are operands of the matrix multiplication. Using the
+/// described one-to-one mapping, the opimization of the matrix
+/// multiplication of the corresponding imaginary matrices can be performed for
+/// the tensor contraction.
+///
+/// @param Node The schedule node to be optimized.
+/// @param TTI  Target Transform Info.
+/// @param TCI  The information about tensors.
+/// @return The optimized schedule node.
+static isl::schedule_node
+convertToMMMSchedule(isl::schedule_node Node,
+                     const llvm::TargetTransformInfo *TTI, TCInfoTy &TCI) {
+  assert(TTI && "The target transform info should be provided.");
+  isl::union_set Domain = Node.get_universe_domain();
+  isl::union_pw_multi_aff IdentityUnionPwAff =
+      Domain.identity_union_pw_multi_aff();
+  auto Dimensions = isl::multi_union_pw_aff(IdentityUnionPwAff);
+  Dimensions = Dimensions.reset_tuple_id(isl::dim::set);
+
+  isl::union_pw_aff IDimensions =
+      flattenDimensions(Dimensions, TCI.OrderedI, TCI.DimensionSizes);
+  isl::union_pw_aff JDimensions =
+      flattenDimensions(Dimensions, TCI.OrderedJ, TCI.DimensionSizes);
+  isl::union_pw_aff PDimensions =
+      flattenDimensions(Dimensions, TCI.OrderedP, TCI.DimensionSizes);
+
+  unsigned DimNumber = unsignedFromIslSize(Dimensions.dim(isl::dim::out));
+  Dimensions = isl::manage(isl_multi_union_pw_aff_drop_dims(
+      Dimensions.release(), isl_dim_out, 3, DimNumber - 3));
+  Dimensions = Dimensions.set_union_pw_aff(0, IDimensions);
+  Dimensions = Dimensions.set_union_pw_aff(1, JDimensions);
+  Dimensions = Dimensions.set_union_pw_aff(2, PDimensions);
+
+  auto NodeType = isl_schedule_node_get_type(Node.get());
+  while (NodeType != isl_schedule_node_domain) {
+    assert((NodeType != isl_schedule_node_sequence) &&
+           L"Prevent the undefined behavior");
+    Node = Node.parent();
+    NodeType = isl_schedule_node_get_type(Node.get());
+  }
+  Node = Node.child(0);
+  Node = isl::manage(isl_schedule_node_cut(Node.release()));
+  return Node.insert_partial_schedule(Dimensions);
+}
+
+static isl::schedule_node
+optimizeTCPattern(isl::schedule_node Node, const llvm::TargetTransformInfo *TTI,
+                  TCInfoTy &TCI) {
+  assert(TTI && "The target transform info should be provided.");
+  Node = convertToMMMSchedule(Node, TTI, TCI);
+
+  MatMulInfoTy MMI = convertToMatMulInfo(TCI);
+  MicroKernelParamsTy MicroKernelParams = getMicroKernelParams(TTI, MMI);
+  MacroKernelParamsTy MacroKernelParams =
+      getMacroKernelParams(TTI, MicroKernelParams, MMI);
+  Node = createMacroKernel(Node, MacroKernelParams);
+  Node = createMicroKernel(Node, MicroKernelParams);
+  if (MacroKernelParams.Mc == 1 || MacroKernelParams.Nc == 1 ||
+      MacroKernelParams.Kc == 1)
+    return Node;
+  isl::map MapOldIndVar = getInductionVariablesSubstitution(
+      Node, MicroKernelParams, MacroKernelParams);
+  if (MapOldIndVar.is_null())
+    return Node;
+  Node = markLoopVectorizerDisabled(Node.parent()).child(0);
+  Node = isolateAndUnrollMatMulInnerLoops(Node, MicroKernelParams);
+  return optimizeDataLayoutMatrMulPattern(Node, MapOldIndVar, MicroKernelParams,
+                                          MacroKernelParams, MMI);
+}
+
 } // namespace
 
 isl::schedule_node
 polly::tryOptimizeMatMulPattern(isl::schedule_node Node,
                                 const llvm::TargetTransformInfo *TTI,
                                 const Dependences *D) {
+  TCInfoTy TCI;
+  if (PMTCBasedOpts && isTCPattern(Node, D, TCI)) {
+    LLVM_DEBUG(dbgs() << "The tensor contraction pattern was detected\n");
+    return optimizeTCPattern(Node, TTI, TCI);
+  }
   MatMulInfoTy MMI;
   if (isMatrMultPattern(Node, D, MMI)) {
     LLVM_DEBUG(dbgs() << "The matrix multiplication pattern was detected\n");

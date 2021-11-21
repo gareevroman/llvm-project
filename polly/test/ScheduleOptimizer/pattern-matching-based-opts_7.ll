@@ -24,9 +24,9 @@
 ;
 ; CHECK:    // 1st level tiling - Tiles
 ; CHECK-NEXT:    for (int c1 = 0; c1 <= 2; c1 += 1) {
-; CHECK-NEXT:      for (int c3 = 0; c3 <= 1023; c3 += 1)
-; CHECK-NEXT:        for (int c4 = 384 * c1; c4 <= min(1023, 384 * c1 + 383); c4 += 1)
-; CHECK-NEXT:          CopyStmt_0(0, c3, c4);
+; CHECK-NEXT:      for (int c4 = 384 * c1; c4 <= min(1023, 384 * c1 + 383); c4 += 1)
+; CHECK-NEXT:        for (int c5 = 0; c5 <= 1023; c5 += 1)
+; CHECK-NEXT:          CopyStmt_0(0, c1, c4, c5);
 ; CHECK-NEXT:      for (int c2 = 0; c2 <= 7; c2 += 1) {
 ; CHECK-NEXT:        for (int c6 = 128 * c2; c6 <= 128 * c2 + 127; c6 += 1)
 ; CHECK-NEXT:          for (int c7 = 384 * c1; c7 <= min(1023, 384 * c1 + 383); c7 += 1)
